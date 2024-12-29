@@ -1,0 +1,21 @@
+{
+    "name": "file-patch-server",
+    "version": "1.0.0",
+    "description": "MCP server for sophisticated file patching operations",
+    "type": "module",
+    "main": "build/index.js",
+    "scripts": {
+        "build": "tsc",
+        "start": "node build/index.js",
+        "dev": "tsc -w"
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^0.6.0",
+        "diff": "^5.1.0"
+    },
+    "devDependencies": {
+        "@types/diff": "^5.0.3",
+        "@types/node": "^20.4.5",
+        "typescript": "^5.1.6"
+    }
+}

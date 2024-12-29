@@ -1,0 +1,307 @@
+    #!/usr/bin/env node
+    import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+    import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+    import {
+    CallToolRequestSchema,
+    ErrorCode,
+    ListToolsRequestSchema,
+    McpError
+    } from '@modelcontextprotocol/sdk/types.js';
+    import { promises as fs, createReadStream, createWriteStream } from 'fs';
+    import { Transform, pipeline } from 'stream';
+    import { promisify } from 'util';
+    import * as diff from 'diff';
+    import { EventEmitter } from 'events';
+    import {
+    PatchOperation,
+    PatchResult,
+    LinePatchOperation,
+    BlockPatchOperation,
+    DiffPatchOperation,
+    CompleteUpdateOperation,
+    PatchValidationResult,
+    NormalizedContent,
+    ContentScope,
+    ScopeType,
+    WhitespaceConfig,
+    BatchConfig,
+    ChunkResult,
+    ProgressInfo
+    } from './types.js';
+    
+    const pipelineAsync = promisify(pipeline);
+    
+    // Default configurations
+    const DEFAULT_BATCH_CONFIG: BatchConfig = {
+    maxChunkSize: 1024 * 1024, // 1MB
+    maxLinesPerChunk: 1000,
+    parallel: false,
+    maxParallelOps: 4,
+    chunkDelay: 100
+    };
+    
+    const DEFAULT_WHITESPACE_CONFIG: WhitespaceConfig = {
+    preserveIndentation: true,
+    preserveLineEndings: true,
+    normalizeWhitespace: true,
+    trimTrailingWhitespace: true,
+    defaultIndentation: '    ',
+    defaultLineEnding: '\n'
+    };
+    
+    interface MethodInfo {
+    name: string;
+    params: string;
+    returnType?: string;
+    modifiers?: string[];
+    constraints?: string[];
+    }
+    
+    /**
+    * Handles processing of file chunks for large files
+    */
+    class ChunkProcessor extends Transform {
+    private config: BatchConfig;
+    private buffer: string = '';
+    private chunkIndex: number = 0;
+    private bytesProcessed: number = 0;
+    private linesProcessed: number = 0;
+    private startTime: number = Date.now();
+    private progressEmitter: EventEmitter;
+    
+    constructor(config: BatchConfig = DEFAULT_BATCH_CONFIG) {
+    super({ objectMode: true });
+    this.config = config;
+    this.progressEmitter = new EventEmitter();
+    }
+    
+    onProgress(listener: (progress: ProgressInfo) => void): void {
+    this.progressEmitter.on('progress', listener);
+    }
+    
+    private shouldProcessChunk(): boolean {
+    const currentSize = this.buffer.length;
+    const lineCount = this.buffer.split('\n').length - 1;
+    const maxChunkSize = this.config?.maxChunkSize ?? DEFAULT_BATCH_CONFIG.maxChunkSize ?? 1024 * 1024;
+    const maxLines = this.config?.maxLinesPerChunk ?? DEFAULT_BATCH_CONFIG.maxLinesPerChunk ?? 1000;
+    return currentSize >= maxChunkSize || lineCount >= maxLines;
+    }
+    
+    private extractChunk(): { content: string; lineCount: number } {
+    const lines = this.buffer.split('\n');
+    const maxLines = this.config.maxLinesPerChunk || DEFAULT_BATCH_CONFIG.maxLinesPerChunk;
+    const chunkLines = lines.slice(0, maxLines);
+    const chunk = chunkLines.join('\n');
+    this.buffer = lines.slice(maxLines).join('\n');
+    return { content: chunk, lineCount: chunkLines.length };
+    }
+    
+    private calculateETA(totalBytes: number): number {
+    const elapsedMs = Date.now() - this.startTime;
+    const bytesPerMs = this.bytesProcessed / elapsedMs;
+    const remainingBytes = totalBytes - this.bytesProcessed;
+    return remainingBytes / bytesPerMs;
+    }
+    
+    private emitProgress(progress: ProgressInfo): void {
+    this.progressEmitter.emit('progress', progress);
+    }
+    
+    async processFile(
+    filePath: string,
+    processor: (chunk: string, chunkInfo: { start: number; end: number }) => Promise<string>
+    ): Promise<ChunkResult[]> {
+    const results: ChunkResult[] = [];
+    const stats = await fs.stat(filePath);
+    const maxChunkSize = this.config?.maxChunkSize ?? DEFAULT_BATCH_CONFIG.maxChunkSize ?? 1024 * 1024;
+    const totalChunks = Math.ceil(stats.size / maxChunkSize);
+    
+    return new Promise((resolve, reject) => {
+    const readStream = createReadStream(filePath, { encoding: 'utf8' });
+    const tempPath = `${filePath}.tmp`;
+    const writeStream = createWriteStream(tempPath, { encoding: 'utf8' });
+    
+    const processChunk = async (chunk: string): Promise<string> => {
+    this.buffer += chunk;
+    let output = '';
+    
+    while (this.shouldProcessChunk()) {
+    const { content, lineCount } = this.extractChunk();
+    const startLine = this.linesProcessed;
+    const endLine = startLine + lineCount;
+    
+    const processed = await processor(content, { start: startLine, end: endLine });
+    
+    this.bytesProcessed += content.length;
+    this.linesProcessed += lineCount;
+    
+    const result: ChunkResult = {
+    success: true,
+    chunkIndex: this.chunkIndex++,
+    startLine,
+    endLine,
+    bytesProcessed: content.length
+    };
+    results.push(result);
+    
+    this.emitProgress({
+    currentChunk: this.chunkIndex,
+    totalChunks,
+    bytesProcessed: this.bytesProcessed,
+    totalBytes: stats.size,
+    linesProcessed: this.linesProcessed,
+    totalLines: -1,
+    startTime: this.startTime,
+    estimatedTimeRemaining: this.calculateETA(stats.size)
+    });
+    
+    if (this.config.chunkDelay) {
+    await new Promise(resolve => setTimeout(resolve, this.config.chunkDelay));
+    }
+    
+    output += processed;
+    }
+    
+    return output;
+    };
+    
+    const transform = new Transform({
+    transform: (chunk, encoding, callback) => {
+    processChunk(chunk.toString())
+    .then(processed => {
+    callback(null, processed);
+    })
+    .catch(error => {
+    callback(error instanceof Error ? error : new Error(String(error)));
+    });
+    },
+    flush: (callback) => {
+    if (this.buffer.length > 0) {
+    processChunk(this.buffer)
+    .then(processed => {
+    callback(null, processed);
+    })
+    .catch(error => {
+    callback(error instanceof Error ? error : new Error(String(error)));
+    });
+    } else {
+    callback();
+    }
+    }
+    });
+    
+    pipelineAsync(readStream, transform, writeStream)
+    .then(() => {
+    fs.rename(tempPath, filePath)
+    .then(() => resolve(results))
+    .catch(err => reject(err));
+    })
+    .catch(err => {
+    fs.unlink(tempPath)
+    .catch(() => { })
+    .finally(() => reject(err));
+    });
+    });
+    }
+    }
+    
+    interface MethodInfo {
+    name: string;
+    params: string;
+    returnType?: string;
+    modifiers?: string[];
+    constraints?: string[];
+    }
+    
+    class FilePatchServer {
+    private server: Server;
+    private chunkProcessor: ChunkProcessor;
+    
+    // Helper functions for C# code analysis
+    private removeComments(line: string): string {
+    return line.replace(/\/\/.*$/, '').replace(/\/\*.*\*\//, '').trim();
+    }
+    
+    private normalizeType(type: string): string {
+    return type.replace(/\s+/g, ' ')
+    .replace(/\b(int|Int32)\b/g, 'int')
+    .replace(/\b(string|String)\b/g, 'string')
+    .replace(/\b(bool|Boolean)\b/g, 'bool')
+    .replace(/\b(float|Single)\b/g, 'float')
+    .replace(/\b(double|Double)\b/g, 'double')
+    .replace(/\b(void|Void)\b/g, 'void')
+    .trim();
+    }
+    
+    private extractMethodInfo(signature: string): MethodInfo | null {
+    const cleanSignature = this.removeComments(signature);
+    if (!cleanSignature) return null;
+    
+    // Extract modifiers
+    const modifiers: string[] = [];
+    const modifierPattern = /\b(public|private|protected|internal|static|virtual|override|abstract|async|sealed|partial)\b/g;
+    let match;
+    while ((match = modifierPattern.exec(cleanSignature)) !== null) {
+    modifiers.push(match[1]);
+    }
+    
+    // Extract return type and method name
+    const methodPattern = /(?:[\w\[\]<>,\s.]+)\s+(\w+)\s*\((.*?)\)/;
+    const methodMatch = cleanSignature.match(methodPattern);
+    if (!methodMatch) return null;
+    
+    // Extract generic constraints
+    const constraints: string[] = [];
+    const constraintPattern = /where\s+[\w<>]+\s*:\s*(?:class|struct|new\(\)|[\w<>,\s]+)/g;
+    while ((match = constraintPattern.exec(cleanSignature)) !== null) {
+    constraints.push(match[0]);
+    }
+    
+    return {
+    name: methodMatch[1],
+    params: methodMatch[2].split(',').map(p => this.normalizeType(p)).join(','),
+    modifiers,
+    constraints
+    };
+    }
+    
+    private isMethodMatch(search: MethodInfo, current: MethodInfo): boolean {
+    // Name must match exactly
+    if (search.name !== current.name) return false;
+    
+    // Parameters must be compatible
+    const searchParams = search.params.replace(/\s+/g, '');
+    const currentParams = current.params.replace(/\s+/g, '');
+    
+    if (searchParams !== currentParams) {
+    // Check if parameter types are compatible
+    const searchParamList = searchParams.split(',').filter(p => p);
+    const currentParamList = currentParams.split(',').filter(p => p);
+    
+    if (searchParamList.length !== currentParamList.length) return false;
+    
+    for (let i = 0; i < searchParamList.length; i++) {
+    const searchType = this.normalizeType(searchParamList[i]);
+    const currentType = this.normalizeType(currentParamList[i]);
+    if (searchType !== currentType) return false;
+    }
+    }
+    
+    // If search specifies modifiers, they must all be present
+    if (search.modifiers && search.modifiers.length > 0) {
+    if (!current.modifiers) return false;
+    for (const modifier of search.modifiers) {
+    if (!current.modifiers.includes(modifier)) return false;
+    }
+    }
+    
+    // If search specifies constraints, they must all be present
+    if (search.constraints && search.constraints.length > 0) {
+    if (!current.constraints) return false;
+    for (const constraint of search.constraints) {
+    if (!current.constraints.includes(constraint)) return false;
+    }
+    }
+    
+    return true;
+    }
