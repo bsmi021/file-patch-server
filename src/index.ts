@@ -1,4 +1,55 @@
 #!/usr/bin/env node
+
+/**
+ * File Patch Server
+ * ================
+ * 
+ * A Model Context Protocol (MCP) server that provides sophisticated file patching capabilities.
+ * This server enables precise modifications to files with support for various patching strategies
+ * and robust handling of whitespace, indentation, and large files.
+ * 
+ * Key Features:
+ * ------------
+ * - Multiple patch operation types (line, block, diff, complete)
+ * - Smart code block detection and replacement
+ * - Method signature matching for precise updates
+ * - Efficient large file handling through chunked processing
+ * - Whitespace preservation and normalization
+ * - Progress tracking with ETA calculation
+ * - Backup creation and validation
+ * 
+ * Patch Operation Types:
+ * --------------------
+ * 1. Line Patch: Replace or delete specific lines by number or pattern
+ * 2. Block Patch: Replace code blocks while preserving structure and indentation
+ * 3. Diff Patch: Apply unified diff format patches
+ * 4. Complete Update: Replace entire file content with proper whitespace handling
+ * 
+ * Usage:
+ * -----
+ * The server exposes a single tool 'apply_patch' that accepts patch operations with:
+ * - type: The type of patch operation to perform
+ * - filePath: Path to the file to modify
+ * - search: Pattern or content to find (for line/block operations)
+ * - replace: Content to replace with
+ * - createBackup: Whether to create a backup before patching
+ * - whitespaceConfig: Configuration for whitespace handling
+ * 
+ * Example:
+ * -------
+ * {
+ *   "operation": {
+ *     "type": "block",
+ *     "filePath": "./src/component.ts",
+ *     "search": "function calculate() {",
+ *     "replace": "function calculate() { // New implementation",
+ *     "createBackup": true
+ *   }
+ * }
+ * 
+ * @module file-patch-server
+ * @version 1.0.0
+ */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -703,15 +754,36 @@ class FilePatchServer {
             const stats = await fs.stat(operation.filePath);
             const effectiveConfig = operation.whitespaceConfig || DEFAULT_WHITESPACE_CONFIG;
 
-            // For large files, use chunk processing
-            if (stats.size >= (DEFAULT_BATCH_CONFIG.maxChunkSize || 1024 * 1024)) {
-                // TODO: Implement chunk processing for large files
-                // For now, fall back to normal processing with a warning
-                console.warn(`Warning: Large file detected (${stats.size} bytes). Chunk processing not yet implemented.`);
-            }
+            // Read and normalize file content
+            const fileContent = stats.size >= (DEFAULT_BATCH_CONFIG.maxChunkSize || 1024 * 1024)
+                ? await (async () => {
+                    const results: ChunkResult[] = [];
+                    let content = '';
 
-            // Process file normally
-            const fileContent = await fs.readFile(operation.filePath, 'utf8');
+                    // Process file in chunks
+                    await this.chunkProcessor.processFile(
+                        operation.filePath,
+                        async (chunk, chunkInfo) => {
+                            const normalized = this.normalizeContent(chunk, effectiveConfig);
+                            content += normalized.normalized;
+
+                            results.push({
+                                success: true,
+                                chunkIndex: results.length,
+                                startLine: chunkInfo.start,
+                                endLine: chunkInfo.end,
+                                bytesProcessed: chunk.length
+                            });
+
+                            return normalized.normalized;
+                        }
+                    );
+
+                    return content;
+                })()
+                : await fs.readFile(operation.filePath, 'utf8');
+
+            // Normalize the content
             const { normalized: content, lineEndings, indentation } = this.normalizeContent(fileContent, effectiveConfig);
 
             let newContent: string;
@@ -798,33 +870,70 @@ class FilePatchServer {
                 case 'block': {
                     const op = operation as BlockPatchOperation;
                     const searchContent = this.normalizeContent(op.search.toString(), effectiveConfig);
-
-                    // Find the first non-empty line in search pattern and clean it
-                    const searchLines = searchContent.normalized.split('\n');
-                    let searchMethodInfo: MethodInfo | null = null;
-                    for (const line of searchLines) {
-                        const cleanedLine = this.removeComments(line);
-                        if (cleanedLine.trim()) {
-                            searchMethodInfo = this.extractMethodInfo(cleanedLine);
-                            if (searchMethodInfo) {
-                                console.error(`[Debug] Found search method info: ${JSON.stringify(searchMethodInfo)}`);
-                                break;
-                            }
-                        }
-                    }
-
-                    if (!searchMethodInfo) {
-                        throw new Error('Could not extract method info from search pattern');
-                    }
-
-                    // Process file content
                     const lines = content.split('\n');
                     const processedLines: string[] = [];
                     let i = 0;
-                    let foundMatch = false;
 
-                    // TODO: Implement block matching logic
-                    newContent = content;
+                    // Detect the scope of the search block
+                    const searchScope = this.detectScope(searchContent.normalized);
+
+                    while (i < lines.length) {
+                        const currentLine = lines[i];
+                        const remainingLines = lines.slice(i).join('\n');
+                        const currentScope = this.detectScope(remainingLines);
+
+                        // If we find a matching scope type
+                        if (currentScope.type === searchScope.type) {
+                            const blockLines = lines.slice(i, i + currentScope.end + 1);
+                            const blockContent = blockLines.join('\n');
+
+                            // For method blocks, use method signature matching
+                            if (currentScope.type === 'method') {
+                                const searchMethodInfo = this.extractMethodInfo(searchContent.normalized);
+                                const currentMethodInfo = this.extractMethodInfo(blockContent);
+
+                                if (searchMethodInfo && currentMethodInfo &&
+                                    this.isMethodMatch(searchMethodInfo, currentMethodInfo)) {
+
+                                    if (op.replace !== undefined) {
+                                        // Apply the replacement while preserving indentation
+                                        const baseIndent = ' '.repeat(currentScope.indentationLevel);
+                                        const replacement = op.replace
+                                            .split('\n')
+                                            .map(line => line.trim() ? baseIndent + line : line)
+                                            .join('\n');
+
+                                        processedLines.push(...replacement.split('\n'));
+                                        changesApplied++;
+                                    }
+                                    i += blockLines.length;
+                                    continue;
+                                }
+                            } else {
+                                // For other block types, use content matching
+                                const normalizedBlock = this.normalizeContent(blockContent, effectiveConfig);
+                                if (normalizedBlock.normalized.includes(searchContent.normalized)) {
+                                    if (op.replace !== undefined) {
+                                        const baseIndent = ' '.repeat(currentScope.indentationLevel);
+                                        const replacement = op.replace
+                                            .split('\n')
+                                            .map(line => line.trim() ? baseIndent + line : line)
+                                            .join('\n');
+
+                                        processedLines.push(...replacement.split('\n'));
+                                        changesApplied++;
+                                    }
+                                    i += blockLines.length;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        processedLines.push(currentLine);
+                        i++;
+                    }
+
+                    newContent = processedLines.join('\n');
                     break;
                 }
 
